@@ -1,6 +1,7 @@
 defmodule Durga.Client do
   defstruct reqs: %{},
-            handlers: %{}
+            handlers: %{},
+            ping: 20_000
 
   require Logger
   alias Durga.Transport
@@ -80,12 +81,12 @@ defmodule Durga.Client do
   end
 
   def init(opts, _) do
-    ## TODO ping the server
-    _ping = opts[:ping]
+    ping = opts[:ping] || 20_000
+    :erlang.send_after(ping, self(), :ping)
     Enum.each(opts[:registered], fn({{module, function, arity, env}, handler}) ->
       send(self(), {:register, module, function, arity, handler, env})
     end)
-    {:ok, %__MODULE__{}}
+    {:ok, %__MODULE__{ping: ping}}
   end
 
   def websocket_handle({:pong, _}, _conn, state) do
@@ -130,6 +131,7 @@ defmodule Durga.Client do
     {:reply, {:binary, msg}, %{state | reqs: reqs}}
   end
   def websocket_info(:ping, _conn, state) do
+    :erlang.send_after(state.ping, self(), :ping)
     {:reply, :ping, state}
   end
 
@@ -143,9 +145,15 @@ defmodule Durga.Client do
         {:error, id, "#{module}:#{function}/#{length(arguments)} not registered"}
       handler ->
         ## TODO we should make this async
-        res = apply(handler, arguments)
-        msg = Transport.encode({:res, id, res})
-        {:reply, {:binary, msg}, state}
+        try do
+          res = apply(handler, arguments)
+          msg = Transport.encode({:res, id, res})
+          {:reply, {:binary, msg}, state}
+        catch
+          error ->
+            msg = Transport.encode({:error, id, 500, Exception.format(:error, error)})
+            {:reply, {:binary, msg}, state}
+        end
     end
   end
   defp handle_message({:res, id, res}, state) do
@@ -155,7 +163,7 @@ defmodule Durga.Client do
     response(id, :error, {code, error}, state)
   end
 
-  def response(id, status, message, state) do
+  defp response(id, status, message, state) do
     reqs = state.reqs
     case Dict.get(reqs, id) do
       {ref, sender} ->
